@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -10,6 +11,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
+
+	// --- NEW IMPORT ---
+	// Import the official Go trace parsing library.
+	"golang.org/x/trace"
 )
 
 // --- CORS Middleware ---
@@ -26,69 +31,67 @@ func withCORS(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// rootHandler serves the main.html file.
+func rootHandler(w http.ResponseWriter, r *http.Request) {
+	http.ServeFile(w, r, "main.html")
+}
+
 func main() {
-	out, err := exec.Command("go", "version").Output()
-	if err != nil {
-		fmt.Println("Could not determine Go version:", err)
-	} else {
-		fmt.Println("Go version used by exec.Command:", string(out))
-	}
+	http.HandleFunc("/", rootHandler)
 	http.HandleFunc("/trace", withCORS(traceHandler))
-	fmt.Println("Go backend listening on :8080 (POST /trace)")
+	println("Go Visualizer server starting on http://localhost:8080")
 	http.ListenAndServe(":8080", nil)
 }
 
 func traceHandler(w http.ResponseWriter, r *http.Request) {
-	// 1. Read the Go code from the request body
-		code, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "Failed to read code", 400)
-			return
-		}
-		fmt.Println("Received code:\n", string(code))
-
-		// 2. Create temporary working directory
-		dir, _ := ioutil.TempDir("", "gtrace")
-		// defer os.RemoveAll(dir) // Uncomment this to auto-clean after testing
-		tmpFile := filepath.Join(dir, "main.go")
-		err = ioutil.WriteFile(tmpFile, code, 0644)
-		if err != nil {
-			http.Error(w, "Failed to write temp file", 500)
-			return
-		}
-
-	// 3. Run the Go code to generate trace.out
-	cmd := exec.Command("go", "run", tmpFile)
-	cmd.Dir = dir
-	output, err := cmd.CombinedOutput()
-	fmt.Println("Go run output:\n", string(output))
+	code, err := ioutil.ReadAll(r.Body)
 	if err != nil {
-		fmt.Println("Go run error:", err)
+		http.Error(w, "Failed to read code", 400)
+		return
+	}
+
+	dir, _ := ioutil.TempDir("", "gtrace")
+	defer os.RemoveAll(dir)
+	tmpFile := filepath.Join(dir, "main.go")
+	if err := ioutil.WriteFile(tmpFile, code, 0644); err != nil {
+		http.Error(w, "Failed to write temp file", 500)
+		return
+	}
+
+	// Use a context with a timeout to prevent long-running programs from hanging the server.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "go", "run", tmpFile)
+	cmd.Dir = dir
+	output, _ := cmd.CombinedOutput()
+
+	// Check if the command was killed due to the timeout.
+	if ctx.Err() == context.DeadlineExceeded {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":         "Execution timed out after 5 seconds.",
+			"go_run_output": "This often happens with long-running servers or programs with infinite loops. Please ensure your program terminates to generate a complete trace.",
+		})
+		return
 	}
 
 	tracePath := filepath.Join(dir, "trace.out")
-	fmt.Println("Trace path:", tracePath)
-
-	// 4. Check if trace.out was generated
 	if _, err := os.Stat(tracePath); os.IsNotExist(err) {
-		missingTraceHint := ""
-		if !bytes.Contains(code, []byte("trace.Start")) || !bytes.Contains(code, []byte("trace.Stop")) {
-			missingTraceHint = "Your code did not include trace.Start/trace.Stop. Please ensure you use the 'Generate Code Wrapper' step before running GTrace."
-		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"error":         "trace.out not generated",
 			"go_run_output": string(output),
-			"run_error":     missingTraceHint,
+			"run_error":     "This can happen if there was a compile error in the code.",
 		})
 		return
 	}
 
-	// 5. Parse trace.out into JSON
+	// --- MODIFICATION: Call the new analyzeTrace function ---
 	jsonData, err := analyzeTrace(tracePath)
 	if err != nil {
-		fmt.Println("Trace analyze error:", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -102,30 +105,85 @@ func traceHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(jsonData)
 }
 
-// analyzeTrace parses trace.out using `go tool trace -json`
+// --- NEW analyzeTrace function ---
+// This function now uses the golang.org/x/trace library directly.
 func analyzeTrace(tracePath string) (map[string]interface{}, error) {
-	cmd := exec.Command("go", "tool", "trace", "-json", tracePath)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-
-	err := cmd.Run()
+	// 1. Open the trace.out file for reading.
+	f, err := os.Open(tracePath)
 	if err != nil {
-		fmt.Println("go tool trace -json failed:", err)
-		fmt.Println("trace tool output:", out.String())
-		return nil, fmt.Errorf("go tool trace failed: %v", err)
+		return nil, fmt.Errorf("could not open trace file: %w", err)
+	}
+	defer f.Close()
+
+	// 2. Parse the trace file using the official library.
+	result, err := trace.Parse(f, "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse trace data: %w", err)
 	}
 
-	// Parse JSON output
-	var parsed interface{}
-	dec := json.NewDecoder(&out)
-	dec.UseNumber()
-	if err := dec.Decode(&parsed); err != nil {
-		return nil, fmt.Errorf("failed to decode trace json: %v", err)
+	// 3. Define structs to hold our simplified graph data.
+	// This matches what the frontend JavaScript expects.
+	type Node struct {
+		ID    uint64 `json:"id"`
+		Label string `json:"label"`
+		Type  string `json:"type"`
+		State string `json:"state"`
+	}
+	type Edge struct {
+		From uint64 `json:"from"`
+		To   uint64 `json:"to"`
+	}
+	type Graph struct {
+		Nodes []Node `json:"nodes"`
+		Edges []Edge `json:"edges"`
 	}
 
+	graph := Graph{
+		Nodes: make([]Node, 0),
+		Edges: make([]Edge, 0),
+	}
+
+	// 4. Loop through all events and build our graph structure.
+	goroutines := make(map[uint64]*Node)
+	// Ensure the main goroutine (ID 1) always exists.
+	goroutines[1] = &Node{ID: 1, Label: "goroutine 1 (main)", Type: "goroutine", State: "running"}
+
+	for _, ev := range result.Events {
+		switch ev.Type {
+		case trace.EvGoCreate:
+			// A new goroutine was created.
+			childID := ev.Args[0]
+			parentID := ev.G
+			if _, ok := goroutines[parentID]; !ok {
+				goroutines[parentID] = &Node{ID: parentID, Label: fmt.Sprintf("goroutine %d", parentID), Type: "goroutine", State: "created"}
+			}
+			if _, ok := goroutines[childID]; !ok {
+				goroutines[childID] = &Node{ID: childID, Label: fmt.Sprintf("goroutine %d", childID), Type: "goroutine", State: "created"}
+			}
+			graph.Edges = append(graph.Edges, Edge{From: parentID, To: childID})
+
+		case trace.EvGoStart:
+			// A goroutine started running.
+			if g, ok := goroutines[ev.G]; ok {
+				g.State = "running"
+			}
+		case trace.EvGoEnd:
+			// A goroutine finished.
+			if g, ok := goroutines[ev.G]; ok {
+				g.State = "finished"
+			}
+		}
+	}
+
+	// 5. Add all found goroutines to the final nodes list.
+	for _, node := range goroutines {
+		graph.Nodes = append(graph.Nodes, *node)
+	}
+
+	// 6. Wrap the graph in a map to match the frontend's expectation.
+	// The frontend JavaScript's `convertTraceToGraph` function is no longer needed
+	// because we are doing the conversion here on the backend.
 	return map[string]interface{}{
-		"trace":     parsed,
-		"timestamp": time.Now().Unix(),
+		"trace": graph, // The key is "trace", but the value is our new Graph struct
 	}, nil
 }
